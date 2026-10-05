@@ -1,0 +1,9 @@
+{
+  "name": "com.faza.android-keystore-autofill",
+  "displayName": "Keystore Auto Filler",
+  "version": "1.0.0",
+  "unity": "2019.4",
+  "description": "Fills Android keystore settings from a central config outside the project.",
+  "keywords": ["android", "keystore", "editor", "build"],
+  "author": { "name": "Maxim Korovin" }
+}
