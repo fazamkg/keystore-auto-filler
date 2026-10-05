@@ -1,9 +1,12 @@
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEditor.Build;
 using UnityEditor.Build.Reporting;
 using UnityEngine;
+using Debug = UnityEngine.Debug;
 
 namespace Faza
 {
@@ -68,19 +71,17 @@ namespace Faza
             }
 
             bool hasKeystoreField = !string.IsNullOrWhiteSpace(entry.keystore);
-            string keystorePath = hasKeystoreField ? Path.Combine(Dir, entry.keystore) : null;
-            bool keystoreFound = hasKeystoreField && File.Exists(keystorePath);
+            string configKeystorePath = hasKeystoreField ? Path.Combine(Dir, entry.keystore) : null;
+            bool keystoreFound = hasKeystoreField && File.Exists(configKeystorePath);
 
-            PlayerSettings.Android.useCustomKeystore = true;
-
+            string selectedKeystore = null;
             if (keystoreFound)
             {
-                PlayerSettings.Android.keystoreName = keystorePath;
-                PlayerSettings.Android.keyaliasName = entry.alias;
+                selectedKeystore = configKeystorePath;
             }
             else
             {
-                // Empty keystore field or file not in config folder: keep project's existing keystore/alias, only fill passwords
+                // Empty keystore field or file not in config folder: keep project's existing keystore
                 string existing = PlayerSettings.Android.keystoreName;
                 if (string.IsNullOrEmpty(existing))
                 {
@@ -89,15 +90,42 @@ namespace Faza
                             $"[Keystore] No keystore in config for '{entry.name}' and project has none set. " +
                             "Only passwords will be applied.");
                 }
-                else if (!silent)
+                else
                 {
-                    string reason = hasKeystoreField
-                        ? $"keystore file missing ({keystorePath})"
-                        : "keystore field empty";
-                    Debug.Log($"[Keystore] {reason}; keeping project keystore/alias and filling passwords for '{entry.name}'");
+                    selectedKeystore = existing;
+                    if (!silent)
+                    {
+                        string reason = hasKeystoreField
+                            ? $"keystore file missing ({configKeystorePath})"
+                            : "keystore field empty";
+                        Debug.Log($"[Keystore] {reason}; keeping project keystore '{existing}' and filling passwords for '{entry.name}'");
+                    }
                 }
             }
 
+            string alias = entry.alias;
+            if (string.IsNullOrWhiteSpace(alias))
+            {
+                if (!string.IsNullOrEmpty(selectedKeystore) && File.Exists(selectedKeystore))
+                {
+                    alias = TryGetFirstAlias(selectedKeystore, entry.storePass);
+                    if (string.IsNullOrEmpty(alias))
+                    {
+                        if (!silent)
+                            Debug.LogWarning($"[Keystore] Could not read first alias from '{selectedKeystore}'");
+                    }
+                    else if (!silent)
+                    {
+                        Debug.Log($"[Keystore] alias empty in config; using first alias '{alias}' from keystore");
+                    }
+                }
+            }
+
+            PlayerSettings.Android.useCustomKeystore = true;
+            if (keystoreFound)
+                PlayerSettings.Android.keystoreName = selectedKeystore;
+            if (!string.IsNullOrWhiteSpace(alias))
+                PlayerSettings.Android.keyaliasName = alias;
             PlayerSettings.Android.keystorePass = entry.storePass;
             PlayerSettings.Android.keyaliasPass = entry.aliasPass;
 
@@ -111,5 +139,112 @@ namespace Faza
                 if (string.Equals(e.name, name, StringComparison.OrdinalIgnoreCase)) return e;
             return null;
         }
-    } 
+
+        static string TryGetFirstAlias(string keystorePath, string storePass)
+        {
+            string keytool = FindKeytool();
+            if (keytool == null) return null;
+
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = keytool,
+                    Arguments = $"-list -keystore \"{keystorePath}\" -storepass \"{storePass ?? ""}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (var process = Process.Start(psi))
+                {
+                    if (process == null) return null;
+                    string stdout = process.StandardOutput.ReadToEnd();
+                    process.StandardError.ReadToEnd();
+                    process.WaitForExit(15000);
+                    if (process.ExitCode != 0) return null;
+                    return ParseFirstAlias(stdout);
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[Keystore] keytool failed: {e.Message}");
+                return null;
+            }
+        }
+
+        static string ParseFirstAlias(string keytoolListOutput)
+        {
+            if (string.IsNullOrEmpty(keytoolListOutput)) return null;
+
+            // Verbose / localized: "Alias name: myalias"
+            var aliasName = Regex.Match(keytoolListOutput, @"^Alias name:\s*(.+)\s*$", RegexOptions.Multiline);
+            if (aliasName.Success)
+                return aliasName.Groups[1].Value.Trim();
+
+            // Default -list: "myalias, 01-Jan-2020, PrivateKeyEntry,"
+            foreach (string rawLine in keytoolListOutput.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string line = rawLine.Trim();
+                if (line.Length == 0) continue;
+                if (line.StartsWith("Keystore ", StringComparison.OrdinalIgnoreCase)) continue;
+                if (line.StartsWith("Your keystore", StringComparison.OrdinalIgnoreCase)) continue;
+                if (line.StartsWith("Certificate ", StringComparison.OrdinalIgnoreCase)) continue;
+
+                int comma = line.IndexOf(',');
+                if (comma <= 0) continue;
+                if (line.IndexOf("PrivateKeyEntry", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    line.IndexOf("SecretKeyEntry", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    line.IndexOf("trustedCertEntry", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                return line.Substring(0, comma).Trim();
+            }
+
+            return null;
+        }
+
+        static string FindKeytool()
+        {
+            // Unity's configured JDK (Android Build Support)
+            string unityJdk = TryGetUnityJdkRoot();
+            if (!string.IsNullOrEmpty(unityJdk))
+            {
+                string candidate = KeytoolInJdk(unityJdk);
+                if (candidate != null) return candidate;
+            }
+
+            string javaHome = Environment.GetEnvironmentVariable("JAVA_HOME");
+            if (!string.IsNullOrEmpty(javaHome))
+            {
+                string candidate = KeytoolInJdk(javaHome);
+                if (candidate != null) return candidate;
+            }
+
+            // Last resort: hope keytool is on PATH
+            return "keytool";
+        }
+
+        static string KeytoolInJdk(string jdkRoot)
+        {
+            string file = Application.platform == RuntimePlatform.WindowsEditor ? "keytool.exe" : "keytool";
+            string path = Path.Combine(jdkRoot, "bin", file);
+            return File.Exists(path) ? path : null;
+        }
+
+        static string TryGetUnityJdkRoot()
+        {
+            try
+            {
+                var type = Type.GetType("UnityEditor.Android.AndroidExternalToolsSettings, UnityEditor.Android.Extensions");
+                var prop = type?.GetProperty("jdkRootPath");
+                return prop?.GetValue(null) as string;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
 }
