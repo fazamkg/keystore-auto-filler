@@ -67,20 +67,41 @@ namespace Faza
                 return;
             }
 
-            string keystorePath = Path.Combine(Dir, entry.keystore);
-            if (!File.Exists(keystorePath))
-            {
-                Debug.LogError($"[Keystore] Keystore file missing: {keystorePath}");
-                return;
-            }
+            bool hasKeystoreField = !string.IsNullOrWhiteSpace(entry.keystore);
+            string keystorePath = hasKeystoreField ? Path.Combine(Dir, entry.keystore) : null;
+            bool keystoreFound = hasKeystoreField && File.Exists(keystorePath);
 
             PlayerSettings.Android.useCustomKeystore = true;
-            PlayerSettings.Android.keystoreName = keystorePath;
+
+            if (keystoreFound)
+            {
+                PlayerSettings.Android.keystoreName = keystorePath;
+                PlayerSettings.Android.keyaliasName = entry.alias;
+            }
+            else
+            {
+                // Empty keystore field or file not in config folder: keep project's existing keystore/alias, only fill passwords
+                string existing = PlayerSettings.Android.keystoreName;
+                if (string.IsNullOrEmpty(existing))
+                {
+                    if (!silent)
+                        Debug.LogWarning(
+                            $"[Keystore] No keystore in config for '{entry.name}' and project has none set. " +
+                            "Only passwords will be applied.");
+                }
+                else if (!silent)
+                {
+                    string reason = hasKeystoreField
+                        ? $"keystore file missing ({keystorePath})"
+                        : "keystore field empty";
+                    Debug.Log($"[Keystore] {reason}; keeping project keystore/alias and filling passwords for '{entry.name}'");
+                }
+            }
+
             PlayerSettings.Android.keystorePass = entry.storePass;
-            PlayerSettings.Android.keyaliasName = entry.alias;
             PlayerSettings.Android.keyaliasPass = entry.aliasPass;
 
-            if (!silent) Debug.Log($"[Keystore] Applied '{entry.name}'");
+            if (!silent && keystoreFound) Debug.Log($"[Keystore] Applied '{entry.name}'");
         }
 
         static KeystoreEntry Find(KeystoreConfig c, string name)
